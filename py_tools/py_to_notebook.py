@@ -36,8 +36,17 @@ class PyToNotebookConverter:
         self.dependency_graph = {}
 
     def _get_local_py_files(self):
-        """获取目录中所有的.py文件列表"""
-        return [f for f in os.listdir(self.base_dir) if f.endswith('.py')]
+        """递归获取项目目录中所有的.py文件相对路径列表"""
+        py_files = []
+        for root, dirs, files in os.walk(self.base_dir):
+            # 排除常见的虚拟环境和缓存目录
+            dirs[:] = [d for d in dirs if d not in ['__pycache__', '.venv', 'venv', 'env']]
+            for file in files:
+                if file.endswith('.py'):
+                    # 计算从base_dir开始的相对路径
+                    relative_path = os.path.relpath(os.path.join(root, file), self.base_dir)
+                    py_files.append(relative_path.replace('\\', '/')) # 保证路径分隔符统一
+        return py_files
 
     def _parse_imports_and_code(self, filename):
         """
@@ -70,15 +79,49 @@ class PyToNotebookConverter:
                     body_lines[i] = ''
                 
                 if isinstance(node, ast.Import):
+                    # 处理形如: import dedup, preprocessing.filter
                     for alias in node.names:
-                        if f"{alias.name}.py" in local_py_files:
-                            local_dependencies.add(f"{alias.name}.py")
-                elif isinstance(node, ast.ImportFrom):
-                    if node.level > 0 or (node.module and f"{node.module}.py" in local_py_files):
-                         module_name = node.module if node.module else ""
-                         if f"{module_name}.py" in local_py_files:
-                            local_dependencies.add(f"{module_name}.py")
+                        module_name = alias.name
+                        module_path_base = module_name.replace('.', '/')
+                        
+                        py_path = f"{module_path_base}.py"
+                        if py_path in local_py_files:
+                            local_dependencies.add(py_path)
+                        
+                        init_path = f"{module_path_base}/__init__.py"
+                        if init_path in local_py_files:
+                            local_dependencies.add(init_path)
 
+                elif isinstance(node, ast.ImportFrom):
+                    # 处理形如: from utils import cycle_documents 或 from dedup import dedup_train
+                    if node.level == 0 and node.module: # 只处理绝对导入
+                        module_name = node.module
+                        module_path_base = module_name.replace('.', '/')
+
+                        # 1. 优先检查 'utils' 是否是一个 .py 文件
+                        py_path = f"{module_path_base}.py"
+                        if py_path in local_py_files:
+                            # 如果是文件，依赖就是这个文件本身，分析结束
+                            local_dependencies.add(py_path)
+                            continue # 处理下一个AST节点，不再分析这个import语句
+
+                        # 2. 如果不是文件，再检查 'dedup' 是否是一个包
+                        init_path = f"{module_path_base}/__init__.py"
+                        if init_path in local_py_files:
+                            # 如果是包，__init__.py 是依赖
+                            local_dependencies.add(init_path)
+
+                            # 继续遍历括号里的具体项 (dedup_train, to_hash, ...) 看它们是否是子模块
+                            for alias in node.names:
+                                name = alias.name
+                                sub_module_path = f"{module_path_base}/{name}.py"
+                                if sub_module_path in local_py_files:
+                                    local_dependencies.add(sub_module_path)
+                                
+                                sub_package_path = f"{module_path_base}/{name}/__init__.py"
+                                if sub_package_path in local_py_files:
+                                    local_dependencies.add(sub_package_path)
+                                
         remaining_code = "\n".join(line for line in body_lines if line.strip())
         return imports, remaining_code, local_dependencies
 
@@ -138,11 +181,13 @@ class PyToNotebookConverter:
             print(f"可能涉及循环依赖的文件: {', '.join(cycle_nodes)}")
             return None
     
+
     def _filter_external_imports(self):
         """
-        从所有收集到的import语句中，过滤出只属于外部库的导入。
+        从所有收集到的import语句中，精准地过滤出只属于外部库的导入。
         """
-        local_module_names = {f.replace('.py', '') for f in self.dependency_graph.keys()}
+        # 获取项目中所有.py文件的相对路径集合，用于快速查找
+        local_py_files = set(self.dependency_graph.keys())
         external_imports = set()
 
         for statement in self.all_imports:
@@ -150,24 +195,31 @@ class PyToNotebookConverter:
                 tree = ast.parse(statement)
                 node = tree.body[0]
                 is_local = False
+
                 if isinstance(node, ast.Import):
+                    # 处理: import a.b.c
                     for alias in node.names:
-                        if alias.name in local_module_names:
+                        module_path = alias.name.replace('.', '/')
+                        # 检查 a/b/c.py 或 a/b/c/__init__.py 是否在本地
+                        if f"{module_path}.py" in local_py_files or f"{module_path}/__init__.py" in local_py_files:
                             is_local = True
-                            break
+                            break # 只要有一个是本地的，整个import语句就算本地的
+                
                 elif isinstance(node, ast.ImportFrom):
-                    # 相对导入一定是本地导入
-                    if node.level > 0:
+                    # 处理: from .a import b 或 from a import b
+                    if node.level > 0: # 相对导入一定是本地的
                         is_local = True
-                    # 检查模块名是否是本地模块
-                    if node.module and node.module in local_module_names:
-                        is_local = True
+                    elif node.module:
+                        module_path = node.module.replace('.', '/')
+                        # 检查 a.py 或 a/__init__.py 是否在本地
+                        if f"{module_path}.py" in local_py_files or f"{module_path}/__init__.py" in local_py_files:
+                            is_local = True
                 
                 if not is_local:
                     external_imports.add(statement)
 
-            except SyntaxError:
-                # 如果某个import语句解析失败，保守地将其视为外部库
+            except (SyntaxError, IndexError):
+                # 如果解析失败（可能是特殊的多行格式），保守地将其视为外部库
                 external_imports.add(statement)
         
         return sorted(list(external_imports))
@@ -251,8 +303,18 @@ def main():
         return
 
     try:
+        # 获取用户想要的文件名
+        output_filename = input("请输入希望保存的 Notebook 文件名 (例如: my_project.ipynb): ").strip()
+        if not output_filename:
+            output_filename = "_generated_notebook.ipynb"
+            print(f"未输入文件名，将使用默认名称: {output_filename}")
+        
+        # 确保文件名以 .ipynb 结尾
+        if not output_filename.endswith('.ipynb'):
+            output_filename += '.ipynb'
+
         converter = PyToNotebookConverter(file_path)
-        converter.convert("_generated_notebook.ipynb")
+        converter.convert(output_filename) # <-- 将获取到的文件名传递进去
     except Exception as e:
         print(f"\n❌ 处理过程中发生错误: {e}")
 
