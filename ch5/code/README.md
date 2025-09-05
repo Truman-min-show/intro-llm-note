@@ -4,7 +4,7 @@ trainable params: 2,359,296 || all params: 1,231,940,608 || trainable%: 0.1915
 
 可以直观地看到使用LoRA微调训练的mt0-large模型的参数量仅为全量的0.2%，极大地减少了计算量
 
-# Qwen3-0.6B 指令微调 — 实验 README（简明版）
+# Qwen3-0.6B 指令微调
 
 ## 概述
 
@@ -16,7 +16,7 @@ trainable params: 2,359,296 || all params: 1,231,940,608 || trainable%: 0.1915
 
 * GPU：1/2 NVIDIA H20（半卡，≈40GB）
 * DeepSpeed：0.17.5
-* PyTorch / Transformers：支持 qwen3 的版本（源码或新版 Transformers）
+* PyTorch / Transformers：支持 qwen3 的版本（最新版的 Transformers）
 * 模型：`./models/Qwen3-0.6B`
 * 数据：`./data/MyDataset/CVPR2024Summary.json`（字段 `prompt` / `chosen` / `rejected`）是我在大创项目中根据同学对摘要的评分收集的文献摘要数据集，地址是我的 [res](https://github.com/Truman-min-show/CVPR2024-DPO-Summary)
 * 训练脚本调用（超参数设置如下）：
